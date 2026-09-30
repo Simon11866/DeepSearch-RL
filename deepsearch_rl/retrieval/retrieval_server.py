@@ -176,8 +176,8 @@ def _search_items_with_retry(search_tool, query: str, topk: int):
             # 不可重试错误：直接抛出
             if not exc.retryable:
                 raise
-            # 可重试：指数退避
-            if search_tool.max_retries:
+            # 可重试：指数退避（最后一次不再 sleep）
+            if attempt < search_tool.max_retries:
                 time.sleep(min(search_tool.backoff_base ** attempt, 8.0))
             continue
     if last_exc is not None:

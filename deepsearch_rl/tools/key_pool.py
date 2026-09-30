@@ -40,7 +40,7 @@ class KeyRotator:
         name: str = "search",
     ) -> None:
         self.name = name
-        self.cooldown_seconds = cooldown
+        self.cooldown_seconds = cooldown_seconds
         # key -> 冷却到期的时间戳（0 表示可用）
         self._cooldown_until: dict = {}
         self._keys: List[str] = []
@@ -68,7 +68,7 @@ class KeyRotator:
     def load_from_file(self, path: str) -> int:
         """从文件加载（每行一个 key，# 开头为注释）。"""
         before = len(self._keys)
-        if not path or not path.exists(path):
+        if not path or not os.path.exists(path):
             return 0
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -120,7 +120,7 @@ def build_key_rotator(
     rotator = KeyRotator(cooldown_seconds=cooldown_seconds, name=name)
     rotator.load_from_env(*env_names)
     if key_file:
-        rotator.load_from_file(key)
+        rotator.load_from_file(key_file)
     return rotator
 
 

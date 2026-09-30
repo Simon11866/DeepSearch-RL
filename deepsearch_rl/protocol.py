@@ -107,7 +107,7 @@ _MALFORMED_RE = re.compile(
 
 # 形如 <search> 的孤立开标签（更容易命中的兜底）
 _ORPHAN_OPEN_RE = re.compile(
-    r"<\s*(search|open|answer)\s*>(?![\s\S]*?</\s*\1\s*>")",
+    r"<\s*(search|open|answer)\s*>(?![\s\S]*?</\s*\1\s*>)",
     re.IGNORECASE,
 )
 # 形如 </search> 的孤立闭标签

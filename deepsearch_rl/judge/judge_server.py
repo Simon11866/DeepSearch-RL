@@ -21,8 +21,8 @@ Answer / Evidence 裁判。默认模型 ``Qwen/Qwen3-8B``（也可换 Qwen2.5-7B
 注意：
 - 上面用了 ``--served-model-name judge``，因此客户端请求时 ``JUDGE_MODEL`` 应设为
   ``judge``（与 served 名一致）；若省略该参数，则用模型路径本身作为模型名。
-- 5090(sm_120) 上 vLLM V1 engine 默认走 FA2 后端，无需额外指定 attention backend。
-- 8B 模型 BF16 约 16GB，``--gpu-memory-utilization 0.4`` 在 32GB 卡上留足 KV cache。
+- 4090(sm_89) 上 vLLM V1 engine 默认走 FA2 后端，无需额外指定 attention backend。
+- 8B 模型 BF16 约 16GB，``--gpu-memory-utilization 0.4`` 在 24GB 卡上留足 KV cache。
 """
 
 from __future__ import annotations
@@ -88,8 +88,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as exc:
-        print(f"[judge_server] vllm 异常退出，code={exc.returncode}", file=sys.stderr)
-        return exc.returncode
+        print(f"[judge_server] vllm 异常退出，code={exc.return_code}", file=sys.stderr)
+        return exc.return_code
     return 0
 
 

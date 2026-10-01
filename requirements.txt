@@ -1,8 +1,8 @@
 # =============================================================================
-# DeepSearch-RL 依赖（Python 3.12 / CUDA 12.8 / 4×RTX 5090）
+# DeepSearch-RL 依赖（Python 3.12 / CUDA 12.6 / 8×RTX 4090）
 #
-# 注意：torch / sglang / verl 需要按 README「环境搭建」用特殊 index 或源码安装，
-# 本文件只固定其余通用依赖，避免 pip 自动解析到错误的 CUDA 车道。
+# 注意：torch / sglang / verl / flash-attn 需要按 README「环境搭建」用特殊 index
+# 或源码安装，本文件只固定其余通用依赖，避免 pip 自动解析到错误的 CUDA 车道。
 # 完整安装顺序见 scripts/install_autodl.sh
 # =============================================================================
 
@@ -13,16 +13,18 @@ huggingface_hub>=0.25.0
 pyarrow>=15.0.0
 
 # ---- 分布式 ----
-# verl 必须 pin v0.6.0（main 已迁 CUDA13/torch2.14，勿用），源码安装：
+# verl 必须 pin v0.6.0（main 已迁 CUDA13/更高 torch，勿用），源码安装：
 #   git clone https://github.com/volcengine/verl.git && cd verl
 #   git checkout v0.6.0 && pip install -e ".[sglang]"
-# SGLang 必须停在 verl requirements_sglang.txt pin 的版本（<=0.5.19，最后 cu12 车道）
+# verl v0.6.0 强制 torch==2.8.0、sglang==0.5.2；4090 用 cu126 车道的 torch2.8
 ray[data,train,tune,serve]>=2.45.0,<2.49
 
-# ---- 训练侧 kernel（免编译 flash-attn 的替代）----
-liger-kernel>=0.8.2
-# 如确需 FlashAttention-2（非 FA3/4，5090 sm_120 需 >=2.7.2，且 nvcc=12.8）：
-#   pip install "flash-attn>=2.7.2" --no-build-isolation
+# ---- 训练侧 kernel ----
+# 4090 sm_89 生态成熟，直接用官方预编译 flash-attn（由 install_autodl.sh 安装）：
+#   flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+flash-attn>=2.8.0
+# 备用：liger-kernel 融合算子（非必需；5090 等不便装 flash-attn 时可改用它）
+#   pip install "liger-kernel>=0.8.2"，并在配置里设 use_liger=true
 
 # ---- 通用训练栈 ----
 transformers>=4.51.0

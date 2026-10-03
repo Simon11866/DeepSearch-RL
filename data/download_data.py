@@ -51,24 +51,42 @@ SOURCE_REGISTRY: Dict[str, Dict[str, Any]] = {
     "hotpotqa": {
         "hf_id": "hotpotqa/hotpot_qa",
         "hf_config": "fullwiki",
-        "ms_id": None,
+        # 官方 json 在 ModelScope 阿里云 OSS，国内比 hf-mirror→Xet/AWS 快一个数量级
+        "ms_id": "OpenDataLab/HotpotQA",
+        "ms_files": {
+            "train": "raw/hotpot_train_v1.1.json",
+            "validation": "raw/hotpot_dev_fullwiki_v1.json",
+        },
         "splits": ["train", "validation"],
     },
     "2wiki": {
         "hf_id": "voidful/2WikiMultihopQA",
         "hf_config": None,
-        "ms_id": None,
+        "ms_id": "voidful/2WikiMultihopQA",
+        "ms_files": {
+            "train": "train.json",
+            "validation": "dev.json",
+        },
         "splits": ["train", "validation"],
     },
     "musique": {
         "hf_id": "dgslibisey/MuSiQue",
         "hf_config": None,
-        "ms_id": None,
+        "ms_id": "voidful/MuSiQue",
+        "ms_files": {
+            "train": "musique_ans_v1.0_train.jsonl",
+            "validation": "musique_ans_v1.0_dev.jsonl",
+        },
         "splits": ["train", "validation"],
     },
     "bamboogle": {
-        # 官方 json，无 train split，只有 validation
+        # 官方 github json 已 404；ModelScope 上有 125 题 parquet 镜像
         "url": "https://raw.githubusercontent.com/ofirpress/self-ask/master/data/bamboogle_2hop.json",
+        "url_mirrors": [
+            "https://cdn.jsdelivr.net/gh/ofirpress/self-ask@master/data/bamboogle_2hop.json",
+        ],
+        "ms_id": "cmriat/bamboogle",
+        "ms_files": {"validation": "data/test-00000-of-00001.parquet"},
         "splits": ["validation"],
     },
 }
@@ -119,6 +137,47 @@ def _write_jsonl(path: str, rows: Iterable[Dict[str, Any]]) -> int:
 # ---------------------------------------------------------------------------
 # 后端加载（惰性导入，避免本地没装 datasets/modelscope 时连 py_compile 都过不了）
 # ---------------------------------------------------------------------------
+def _load_json_or_jsonl(path: str) -> List[Dict[str, Any]]:
+    """读官方 json（list[dict]）、jsonl 或单文件 parquet。"""
+    if path.endswith(".parquet"):
+        import pandas as pd  # 惰性导入
+
+        df = pd.read_parquet(path)
+        rows = df.to_dict(orient="records")
+        for r in rows:
+            for k, v in list(r.items()):
+                if hasattr(v, "tolist") and not isinstance(v, (str, bytes)):
+                    r[k] = v.tolist()
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        if path.endswith(".jsonl"):
+            rows = []
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+            return rows
+        data = json.load(f)
+    if isinstance(data, list):
+        return data
+    raise RuntimeError(f"期望 list 或 jsonl，实际 {type(data)}：{path}")
+
+
+def _load_via_modelscope_files(ms_id: str, file_path: str) -> List[Dict[str, Any]]:
+    """从 ModelScope 数据集仓库按文件拉取（走阿里云，避免 HF Xet）。"""
+    try:
+        from modelscope.hub.file_download import dataset_file_download
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(f"[modelscope] 未安装或导入失败：{e}")
+
+    cache = os.environ.get("MODELSCOPE_CACHE") or os.environ.get(
+        "DEEPSEARCH_MS_CACHE", "/root/autodl-tmp/ms_ds"
+    )
+    print(f"[modelscope] 下载 {ms_id} / {file_path} -> {cache}")
+    local = dataset_file_download(dataset_id=ms_id, file_path=file_path, cache_dir=cache)
+    return _load_json_or_jsonl(local)
+
+
 def _load_via_modelscope(ms_id: str, config: Optional[str], split: str):
     """尝试用 ModelScope MsDataset 加载某个 split，失败抛异常由上层回退。"""
     try:
@@ -154,14 +213,30 @@ def _load_via_hf(hf_id: str, config: Optional[str], split: str):
 def load_split(source: str, spec: Dict[str, Any], split: str, backend: str):
     """根据 backend 选择加载方式，返回可迭代的原始行。"""
     if source == "bamboogle":
-        return _load_bamboogle(spec["url"])
+        ms_id = spec.get("ms_id")
+        ms_files = spec.get("ms_files") or {}
+        if backend in ("auto", "modelscope") and ms_id and split in ms_files:
+            try:
+                print(f"[bamboogle] 尝试 modelscope {ms_id}/{ms_files[split]}")
+                return _load_via_modelscope_files(ms_id, ms_files[split])
+            except Exception as e:
+                print(f"[bamboogle] modelscope 失败，回退 HTTP：{e}")
+        return _load_bamboogle(spec["url"], spec.get("url_mirrors"))
 
     hf_id = spec["hf_id"]
     config = spec.get("hf_config")
     ms_id = spec.get("ms_id")
+    ms_files = spec.get("ms_files") or {}
 
     ms_tried = False
-    if backend in ("auto", "modelscope") and ms_id:
+    if backend in ("auto", "modelscope") and ms_id and split in ms_files:
+        ms_tried = True
+        try:
+            print(f"[{source}] 尝试 modelscope 文件 {ms_id}/{ms_files[split]} ...")
+            return _load_via_modelscope_files(ms_id, ms_files[split])
+        except Exception as e:
+            print(f"[{source}] modelscope 文件失败，尝试 MsDataset / HF：{e}")
+    if backend in ("auto", "modelscope") and ms_id and split not in ms_files:
         ms_tried = True
         try:
             print(f"[{source}] 尝试 modelscope 加载 {ms_id} ({split}) ...")
@@ -186,12 +261,30 @@ def load_split(source: str, spec: Dict[str, Any], split: str, backend: str):
         )
 
 
-def _load_bamboogle(url: str) -> List[Dict[str, Any]]:
-    """Bamboogle 是官方 GitHub 上的一个静态 json（list[dict]），直接 HTTP 拉取。"""
-    print(f"[bamboogle] 下载官方 json：{url}")
+def _http_get(url: str, timeout: int = 60) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "deepsearch-rl/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read().decode("utf-8")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _load_bamboogle(url: str, mirrors: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Bamboogle 是官方 GitHub 上的一个静态 json（list[dict]），直接 HTTP 拉取。"""
+    urls = [url] + list(mirrors or [])
+    last_err: Optional[Exception] = None
+    raw = ""
+    for u in urls:
+        try:
+            print(f"[bamboogle] 下载官方 json：{u}")
+            raw = _http_get(u).decode("utf-8")
+            if raw.strip().startswith("404"):
+                raise RuntimeError("404")
+            break
+        except Exception as e:
+            last_err = e
+            print(f"[bamboogle] {u} 失败：{e}")
+            raw = ""
+    if not raw:
+        raise RuntimeError(f"[bamboogle] 所有镜像均失败：{last_err}")
     data = json.loads(raw)
     if not isinstance(data, list):
         raise RuntimeError(f"[bamboogle] 官方 json 顶层应为 list，实际为 {type(data)}")
@@ -291,7 +384,7 @@ def normalize_2wiki(row: Dict[str, Any]) -> Dict[str, Any]:
         "question": question,
         "gold_answers": gold,
         "type": row.get("type", "unknown"),
-        "level": "hard",
+        "level": row.get("level", "hard"),
         "num_hops": 2,
         "supporting_titles": uniq,
     }
@@ -393,6 +486,10 @@ def process_source(source: str, out_dir: str, backend: str, nq_limit: Optional[i
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # AutoDL / 国内：关掉 Xet 网关，走 HF_ENDPOINT 镜像拉 parquet
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.environ.setdefault("HF_ENDPOINT", HF_MIRROR)
+
     parser = argparse.ArgumentParser(description="下载多跳 QA 数据集并归一为统一中间 jsonl")
     parser.add_argument("--out_dir", default="data/raw", help="输出目录（默认 data/raw）")
     parser.add_argument(

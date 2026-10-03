@@ -30,14 +30,21 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from ..tools.exceptions import ToolError, ToolErrorType
+from ..tools.search_backend import (
+    FREE_SEARCH_CHAIN,
+    KEYLESS_BACKENDS,
+    FallbackProvider,
+    probe_engine,
+)
 from ..tools.tool_factory import (
     build_key_rotator_for_backend,
     build_open_tool,
@@ -80,6 +87,10 @@ class _Context:
         self.search_tool = build_search_tool(cfg)
         self.open_tool = build_open_tool(cfg)
         self.backend = self.search_tool.backend
+        self.active_engine = (
+            FREE_SEARCH_CHAIN[0] if self.backend == "free" else self.backend
+        )
+        self.engine_lock = threading.Lock()
         self.sem = asyncio.Semaphore(int(cfg.get("concurrency", 120)))
 
 
@@ -87,7 +98,7 @@ def _load_config_from_env() -> dict:
     """从环境变量读取服务配置（缺省值见下）。"""
     return {
         # 搜索后端：serper/serpapi/bing/brave/tavily/ddg；无 key 时自动回退 ddg
-        "backend": os.environ.get("SEARCH_BACKEND", "serper"),
+        "backend": os.environ.get("SEARCH_BACKEND", "free"),
         "num_results": int(os.environ.get("RETRIEVE_TOPK", "5")),
         "max_retries": int(os.environ.get("SEARCH_MAX_RETRIES", "4")),
         "timeout": float(os.environ.get("SEARCH_TIMEOUT", "15")),
@@ -100,18 +111,18 @@ def _load_config_from_env() -> dict:
 
 
 def _resolve_backend(cfg: dict) -> str:
-    """若选定的付费后端没有任何可用 key，则回退到免费的 ddg。"""
-    backend = (cfg.get("backend") or "serper").lower()
-    if backend == "ddg":
+    """若选定的付费后端没有任何可用 key，则回退到免费引擎链。"""
+    backend = (cfg.get("backend") or "free").lower()
+    if backend in KEYLESS_BACKENDS:
         return backend
     rotator = build_key_rotator_for_backend(backend, cfg.get("key_file"),
                                             float(cfg.get("cooldown", 60.0)))
     if len(rotator) == 0:
         logger.warning(
-            "后端 %s 未配置任何 API key（环境变量/key_file），自动回退到免费 ddg。",
+            "后端 %s 未配置任何 API key（环境变量/key_file），自动回退到免费引擎链。",
             backend,
         )
-        return "ddg"
+        return "free"
     return backend
 
 
@@ -153,21 +164,78 @@ def _get_ctx() -> _Context:
 # ---------------------------------------------------------------------------
 # 结构化搜索：复用 SearchTool 的 provider/rotator/重试，但返回 List[SearchItem]
 # ---------------------------------------------------------------------------
-def _search_items_with_retry(search_tool, query: str, topk: int):
+def _rotated_chain(ctx: _Context) -> tuple:
+    """当前引擎放在最前。本步开始前已经确认过它可用。"""
+    if ctx.backend != "free":
+        return (ctx.backend,)
+    chain = list(FREE_SEARCH_CHAIN)
+    with ctx.engine_lock:
+        active = ctx.active_engine
+    if active in chain:
+        index = chain.index(active)
+        chain = chain[index:] + chain[:index]
+    return tuple(chain)
+
+
+def _ensure_active_engine(ctx: _Context) -> dict:
+    """从当前引擎开始探测。不可用就换下一个，直到有一个能返回结果。"""
+    if ctx.backend == "free":
+        order = _rotated_chain(ctx)
+    else:
+        order = (ctx.backend,)
+    attempts = []
+    with ctx.engine_lock:
+        previous = ctx.active_engine
+    for name in order:
+        key = ctx.search_tool.rotator.get() if name == "tavily" else None
+        ok, detail = probe_engine(name, timeout=12.0 if name == "tavily" else 8.0, key=key)
+        attempts.append(f"{name}:{'ok' if ok else detail}")
+        logger.info("搜索引擎探测 %s -> %s", name, "ok" if ok else detail)
+        if not ok:
+            continue
+        with ctx.engine_lock:
+            ctx.active_engine = name
+        return {
+            "ok": True,
+            "backend": name,
+            "switched": name != previous,
+            "attempts": attempts,
+        }
+    return {
+        "ok": False,
+        "backend": previous,
+        "switched": False,
+        "attempts": attempts,
+    }
+
+
+def _search_items_with_retry(ctx: _Context, query: str, topk: int):
     """与 search.SearchTool._run 完全一致的 key 轮换 + 指数退避策略，
 
     区别仅在于不格式化为给模型的文本，而是直接返回 provider 给出的 List[SearchItem]。
     （provider.search 是同步 urllib 调用，本函数也同步，由调用方放进线程池。）
+    免费链从本步确认过的引擎开始；这个引擎中途失败才换下一个。
     """
+    search_tool = ctx.search_tool
+    provider = search_tool.provider
+    if search_tool.backend == "free":
+        provider = FallbackProvider(
+            timeout=getattr(search_tool.provider, "timeout", 15.0),
+            chain=_rotated_chain(ctx),
+        )
     last_exc: Optional[ToolError] = None
     for attempt in range(search_tool.max_retries + 1):
         key = search_tool.rotator.get()
-        # ddg 不需要 key；其它后端在所有 key 都冷却时退避等待
-        if search_tool.backend != "ddg" and key is None:
+        # 免费后端不需要 key；付费后端在所有 key 都冷却时退避等待
+        if search_tool.backend not in KEYLESS_BACKENDS and key is None:
             time.sleep(min(search_tool.backoff_base ** attempt, 8.0))
             continue
         try:
-            return search_tool.provider.search(query, key=key, num=topk)
+            items = provider.search(query, key=key, num=topk)
+            if isinstance(provider, FallbackProvider) and provider.last_engine:
+                with ctx.engine_lock:
+                    ctx.active_engine = provider.last_engine
+            return items
         except ToolError as exc:
             last_exc = exc
             # 限流/鉴权/配额：冷却当前 key，轮换下一个
@@ -176,7 +244,7 @@ def _search_items_with_retry(search_tool, query: str, topk: int):
             # 不可重试错误：直接抛出
             if not exc.retryable:
                 raise
-            # 可重试：指数退避（最后一次不再 sleep）
+            # 可重试：指数退避
             if attempt < search_tool.max_retries:
                 time.sleep(min(search_tool.backoff_base ** attempt, 8.0))
             continue
@@ -191,13 +259,13 @@ def _retrieve_one_sync(ctx: _Context, query: str, topk: int, return_scores: bool
     if not normalized:
         return []
     # 缓存 key 带上 topk，避免不同条数互相污染；namespace 与给模型的文本缓存隔离
-    cache_arg = f"{topk}::{normalized}"
+    cache_arg = f"{ctx.backend}::{topk}::{normalized}"
     cached = ctx.cache.get("search_items", cache_arg)
     if cached is not None:
         items = cached  # 已是 list[dict]
     else:
         try:
-            search_items = _search_items_with_retry(ctx.search_tool, query, topk)
+            search_items = _search_items_with_retry(ctx, query, topk)
             items = [it.to_dict() for it in search_items]
             ctx.cache.set("search_items", cache_arg, items)
         except ToolError as exc:
@@ -267,6 +335,16 @@ async def open_page(req: OpenRequest):
     }
 
 
+@app.post("/search_ready")
+async def search_ready():
+    """训练每一步开始前调用：当前引擎可用就用它，否则换成下一个可用引擎。"""
+    ctx = _get_ctx()
+    result = await asyncio.to_thread(_ensure_active_engine, ctx)
+    if not result["ok"]:
+        raise HTTPException(status_code=503, detail=result)
+    return result
+
+
 @app.get("/health")
 async def health():
     """健康检查：返回缓存统计与当前可用 key 数。"""
@@ -274,6 +352,7 @@ async def health():
     return {
         "status": "ok",
         "backend": ctx.backend,
+        "active_engine": ctx.active_engine,
         "cache": ctx.cache.stats(),
         "keys_available": ctx.search_tool.rotator.available_count(),
     }

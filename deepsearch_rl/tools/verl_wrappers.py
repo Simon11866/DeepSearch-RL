@@ -16,8 +16,10 @@ veRL 工具封装（verl_wrappers）
 - 本文件顶部对 verl 采用 try/except 导入：本地没装 verl/torch 时给出清晰占位基类，
   保证 ``py_compile`` 与单测可跑；真正训练环境里再用 verl 的真实实现。
 - ``__init__`` 不发起任何网络请求；网络调用只发生在 execute 里。
-- 任何失败都不抛异常中断 rollout，而是返回 ``ToolResponse(text="[工具失败] ...")``
+- 任何失败都不抛异常中断 rollout，而是返回带 ``<observation>`` 的失败说明，
   并在 metrics 里带上 error_type；step_reward 恒为 0.0（奖励统一由 reward 函数计算）。
+- 成功和失败的文本都包进 ``<observation>``。证据分只认这个标签里的内容；
+  裸文本会被当成没有证据，分数恒为 0。
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any, Dict, Optional
+
+from deepsearch_rl.protocol import build_error_observation, build_observation
 
 # ---------------------------------------------------------------------------
 # verl 依赖的容错导入：本地没装 verl 时用占位类顶替，保证可导入 / 可单测
@@ -143,7 +147,9 @@ class _BaseWrapper(_VerlBaseTool):
         start = time.time()
 
         if not value:
-            resp = _make_response(f"[工具失败] 缺少参数 {self.param_key}")
+            resp = _make_response(
+                build_error_observation("bad_request", f"缺少参数 {self.param_key}")
+            )
             return resp, 0.0, {"error_type": "bad_request", "elapsed": 0.0}
 
         try:
@@ -158,13 +164,17 @@ class _BaseWrapper(_VerlBaseTool):
                     raise RuntimeError(getattr(result, "error_type", "unknown"))
                 text = result.content
             metrics["elapsed"] = round(time.time() - start, 3)
-            return _make_response(text), 0.0, metrics
+            return _make_response(build_observation(text)), 0.0, metrics
         except Exception as exc:  # noqa: BLE001 - 工具失败绝不中断 rollout
             err_type = getattr(exc, "error_type", None) or type(exc).__name__
             metrics.update(
                 {"error_type": err_type, "elapsed": round(time.time() - start, 3)}
             )
-            return _make_response(f"[工具失败] {err_type}: {exc}"), 0.0, metrics
+            return (
+                _make_response(build_error_observation(err_type, str(exc))),
+                0.0,
+                metrics,
+            )
 
 
 class SearchToolWrapper(_BaseWrapper):

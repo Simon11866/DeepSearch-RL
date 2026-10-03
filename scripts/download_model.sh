@@ -28,19 +28,14 @@ if ! python -c "import modelscope" 2>/dev/null; then
 fi
 
 # ---- 方式 A：modelscope 命令行（推荐，断点续传）----
-#   modelscope download \
-#       --model "${MODEL_ID}" \
-#       --local_dir "${MODEL_DIR}"
+if command -v modelscope >/dev/null 2>&1; then
+  modelscope download --model "${MODEL_ID}" --local_dir "${MODEL_DIR}"
+else
+  python - <<PY
+from modelscope import snapshot_download
+p = snapshot_download("${MODEL_ID}", local_dir="${MODEL_DIR}")
+print("模型已下载到：", p)
+PY
+fi
 
-# ---- 方式 B：python SDK ----
-# python - <<PY
-# from modelscope import snapshot_download
-# p = snapshot_download(
-#     "${MODEL_ID}",
-#     local_dir="${MODEL_DIR}",
-# )
-# print("模型已下载到：", p)
-# PY
-
-echo ">>> 取消上方任一方式的注释即可开始下载。"
-echo ">>> 下载完成后，把 MODEL_PATH 指向 ${MODEL_DIR} 即可在 configs/grpo_qwen3_8b_8x4090.yaml 中使用。"
+echo ">>> 下载完成。export MODEL_PATH=${MODEL_DIR}"

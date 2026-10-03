@@ -1,0 +1,4 @@
+# AgentLoopWorker 是独立 Ray 进程，不会继承主进程里的 @register。
+# 必须用这份配置在 worker 内按 _target_ 实例化。
+- name: deepsearch_agent
+  _target_: deepsearch_rl.agent.deepsearch_loop.DeepSearchAgentLoop

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-DeepSearch-RL 主训练入口（GRPO / veRL / SGLang / 8×4090）
+DeepSearch-RL 主训练入口（GRPO / veRL / SGLang / 6×RTX 4090）
 ======================================================
 
-职责：把工程内「可读的嵌套 yaml」（configs/grpo_qwen3_8b_8x4090.yaml）翻译成
+职责：把工程内「可读的嵌套 yaml」（configs/grpo_qwen3_8b_6x4090.yaml）翻译成
 veRL 自带的 Hydra 配置（``ppo_trainer``），再调用 ``verl.trainer.main_ppo.run_ppo``。
 
 为什么要这一层包装
@@ -30,7 +30,7 @@ veRL v0.6.0 的配置是 Hydra 组合出来的，命令行习惯是 ``key=value`
 
     # 指定配置 + 任意 Hydra 覆盖（key=value 直接跟在后面即可）
     python -m deepsearch_rl.train.train_grpo \
-        --config configs/grpo_qwen3_8b_8x4090.yaml \
+        --config configs/grpo_qwen3_8b_6x4090.yaml \
         data.train_batch_size=128 actor_rollout_ref.rollout.n=5
 
     # 只看最终会下发给 veRL 的覆盖项与解析后配置，不真正起训练（本地/CI 用）
@@ -63,12 +63,9 @@ _JUDGE_ENV_MAP = {
     "base_url": "JUDGE_BASE_URL",
     "model": "JUDGE_MODEL",
     "sufficiency_threshold": "JUDGE_SUFFICIENCY_THRESHOLD",
+    "max_concurrency": "JUDGE_MAX_CONCURRENCY",
+    "timeout": "JUDGE_TIMEOUT",
 }
-
-# 路径类列表键：逐项拍平为 Hydra 列表元素覆盖（+key.0=...、+key.1=...），
-# 而不是内联 [a,b]。这样 CLI 上再追加一条数据目录也很直观。
-_PATH_LIST_KEYS = ("train_files", "val_files", "test_files")
-
 
 # ---------------------------------------------------------------------------
 # 基础工具：标量 / Hydra 值字符串化
@@ -98,16 +95,15 @@ def _format_scalar(v: Any) -> str:
     return s
 
 
-def _flatten(cfg: dict, prefix: str = "") -> List[Tuple[str, str]]:
+def _flatten(cfg: dict, prefix: str = "", force_plus: bool = False) -> List[Tuple[str, str]]:
     """把嵌套 dict 递归拍平成 ``(dot_key, override_value)`` 列表。
 
     规则：
     - 嵌套 dict -> 继续下钻（``a.b.c``）；
     - 标量 -> 直接 ``key=value``；
-    - 标量列表：
-        * 路径类键（train_files/val_files/test_files）-> 逐项 ``+key.0=v0``、``+key.1=v1``
-          （Hydra 逐元素覆盖语法，可在空列表/None 默认值上创建列表）；
-        * 其余（如 ``trainer.logger=[console,swanlab]``）-> 内联 ``key=[v0,v1]``；
+    - 标量列表（含 train_files/val_files）：内联 ``key=[v0,v1]``。
+      不要写成 ``+key.0=v0``——Hydra struct 下会变成 dict ``{'0': v0}``，
+      veRL 再访问 ``train_files[-1]`` 就会 ConfigKeyError。
     - 非标量列表（dict 列表）：本工程主 yaml 中不存在（工具挂载走外部
       ``tool_config_path``），遇到时打印警告并跳过，避免拍出错位的键。
     """
@@ -115,18 +111,17 @@ def _flatten(cfg: dict, prefix: str = "") -> List[Tuple[str, str]]:
     for k, v in cfg.items():
         key = f"{prefix}.{k}" if prefix else str(k)
         if isinstance(v, dict):
-            out.extend(_flatten(v, key))
+            child_plus = force_plus or str(k) in {
+                "apply_chat_template_kwargs",
+                "engine_kwargs",
+                "sglang",
+            }
+            out.extend(_flatten(v, key, force_plus=child_plus))
         elif isinstance(v, list):
             if not v:
                 continue
             if all(_is_scalar(x) for x in v):
-                if key.split(".")[-1] in _PATH_LIST_KEYS:
-                    # 路径列表：逐项 +key.{idx}=item
-                    for idx, item in enumerate(v):
-                        out.append((f"+{key}.{idx}", _format_scalar(item)))
-                else:
-                    # 普通标量列表：内联 [a,b]
-                    out.append((key, "[" + ",".join(_format_scalar(x) for x in v) + "]"))
+                out.append((key, "[" + ",".join(_format_scalar(x) for x in v) + "]"))
             else:
                 print(
                     f"[warn] 复杂（dict）列表未拍平，已跳过：{key}；"
@@ -134,7 +129,8 @@ def _flatten(cfg: dict, prefix: str = "") -> List[Tuple[str, str]]:
                     file=sys.stderr,
                 )
         else:
-            out.append((key, _format_scalar(v)))
+            out_key = f"+{key}" if force_plus else key
+            out.append((out_key, _format_scalar(v)))
     return out
 
 
@@ -151,6 +147,60 @@ def _extract_env_sections(cfg: dict) -> dict:
             os.environ[env_name] = str(judge[yaml_key])
 
     return {"retrieval": retrieval, "judge": judge}
+
+
+def _project_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _abs_if_rel(path: Any, root: str) -> Any:
+    if not isinstance(path, str) or not path or os.path.isabs(path):
+        return path
+    return os.path.join(root, path)
+
+
+def _absolutize_local_paths(cfg: dict) -> None:
+    """把 yaml 里的相对本地路径改成绝对路径。"""
+    root = _project_root()
+    try:
+        mt = cfg["actor_rollout_ref"]["rollout"]["multi_turn"]
+        mt["tool_config_path"] = _abs_if_rel(mt.get("tool_config_path"), root)
+    except (KeyError, TypeError):
+        pass
+    try:
+        ag = cfg["actor_rollout_ref"]["rollout"]["agent"]
+        ag["agent_loop_config_path"] = _abs_if_rel(ag.get("agent_loop_config_path"), root)
+    except (KeyError, TypeError):
+        pass
+    cr = cfg.get("custom_reward_function") or {}
+    if "path" in cr:
+        cr["path"] = _abs_if_rel(cr["path"], root)
+    data = cfg.get("data") or {}
+    for key in ("train_files", "val_files", "test_files"):
+        val = data.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            paths = [_abs_if_rel(val, root)]
+        elif isinstance(val, list):
+            paths = [_abs_if_rel(x, root) for x in val]
+        else:
+            continue
+        expanded: list[str] = []
+        for p in paths:
+            if isinstance(p, str) and os.path.isdir(p):
+                shards = sorted(
+                    os.path.join(p, name)
+                    for name in os.listdir(p)
+                    if name.endswith(".parquet")
+                )
+                if not shards:
+                    print(f"[错误] 数据目录为空（无 parquet）：{p}", file=sys.stderr)
+                    sys.exit(2)
+                expanded.extend(shards)
+            else:
+                expanded.append(p)
+        data[key] = expanded
 
 
 def _check_model_path(dry_run: bool) -> None:
@@ -178,7 +228,7 @@ def build_overrides(config_path: str, dry_run: bool) -> Tuple[List[str], dict, L
     """加载 yaml、拆 env 段、拍平成 Hydra dotlist。
 
     返回 (dotlist, env_sections, veRL_nested_dict)。
-    dotlist 形如 ``["actor_rollout_ref.rollout.n=7", "+data.train_files.0=data/processed/train", ...]``。
+    dotlist 形如 ``["actor_rollout_ref.rollout.n=7", "data.train_files=[/abs/train]", ...]``。
     """
     if not os.path.isfile(config_path):
         print(f"[错误] 配置文件不存在：{config_path}", file=sys.stderr)
@@ -197,6 +247,9 @@ def build_overrides(config_path: str, dry_run: bool) -> Tuple[List[str], dict, L
     # 1) 拆 retrieval/judge -> 环境变量
     env_sections = _extract_env_sections(container)
 
+    # 相对路径改成工程根绝对路径，避免 Hydra/Ray worker 换 cwd 后找不到
+    _absolutize_local_paths(container)
+
     # 2) 拍平剩余 veRL 原生段
     flat = _flatten(container)
     dotlist = [f"{k}={v}" for k, v in flat]
@@ -212,8 +265,8 @@ def parse_cli(argv: List[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="configs/grpo_qwen3_8b_8x4090.yaml",
-        help="主配置 yaml（默认 configs/grpo_qwen3_8b_8x4090.yaml）",
+        default="configs/grpo_qwen3_8b_6x4090.yaml",
+        help="主配置 yaml（默认 configs/grpo_qwen3_8b_6x4090.yaml）",
     )
     parser.add_argument(
         "--dry_run",
@@ -227,6 +280,9 @@ def parse_cli(argv: List[str]) -> argparse.Namespace:
 
 
 def main(argv: List[str] | None = None) -> None:
+    from deepsearch_rl.utils.config import load_dotenv
+
+    load_dotenv()
     args = parse_cli(sys.argv[1:] if argv is None else argv)
 
     # 相对路径基于工程根目录（train_grpo 通常从工程根用 -m 调用）
@@ -264,6 +320,7 @@ def main(argv: List[str] | None = None) -> None:
             "JUDGE_BASE_URL",
             "JUDGE_MODEL",
             "JUDGE_SUFFICIENCY_THRESHOLD",
+            "JUDGE_MAX_CONCURRENCY",
             "SWANLAB_MODE",
         ):
             print(f"  {env_name}={os.environ.get(env_name, '<未设置>')}")

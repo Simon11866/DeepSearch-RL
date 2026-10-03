@@ -30,7 +30,14 @@ sys.path.insert(0, os.path.join(_PROJECT_ROOT, "data"))
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from prepare_train import record_to_parquet_row, SYSTEM_PROMPT  # noqa: E402
+from prepare_train import (  # noqa: E402
+    SYSTEM_PROMPT,
+    FAST_TRAIN_QUOTA,
+    FAST_VAL_QUOTA,
+    record_to_parquet_row,
+    _select_fast_hotpot,
+    _select_fast_musique,
+)
 
 
 def _sample_records():
@@ -84,6 +91,8 @@ def main() -> int:
         assert row["extra_info"]["split"] == "train"
         assert row["extra_info"]["index"] == i
         assert row["extra_info"]["num_hops"] == records[i]["num_hops"]
+        assert row["extra_info"]["question"] == records[i]["question"]
+        assert row["extra_info"]["supporting_titles"] == records[i]["supporting_titles"]
 
         prompt = row["prompt"]
         assert isinstance(prompt, list) and len(prompt) == 2, f"row{i} prompt 不是 2 条"
@@ -122,6 +131,25 @@ def main() -> int:
         print(f"  - source={r['data_source']:<9} hops={r['extra_info']['num_hops']} "
               f"target={r['reward_model']['ground_truth']['target']}")
     print("[PASS] pyarrow 内存写读回一致，prompt 为 list[dict]、ground_truth.target 为 list[str]。")
+
+    assert sum(FAST_TRAIN_QUOTA.values()) == 1728, "6h 训练集应为 36×48=1728"
+    assert sum(FAST_VAL_QUOTA.values()) == 48, "6h val 应为 1×48=48"
+    rng = __import__("random").Random(42)
+    hotpot = [
+        {"id": f"h{i}", "level": "hard" if i < 5 else "easy", "type": "bridge"}
+        for i in range(20)
+    ]
+    got = _select_fast_hotpot(hotpot, 6, rng)
+    assert len(got) == 6
+    assert sum(1 for r in got if r["level"] == "hard") >= 5
+    mus = [
+        {"id": f"m{i}", "num_hops": 4 if i < 3 else (3 if i < 8 else 2)}
+        for i in range(20)
+    ]
+    got_m = _select_fast_musique(mus, 5, rng)
+    assert len(got_m) == 5
+    assert min(int(r["num_hops"]) for r in got_m) >= 3
+    print("[PASS] 6h 快训配额与难例优先抽样断言通过。")
     return 0
 
 

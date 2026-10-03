@@ -30,7 +30,7 @@ API key 来源（按后端读取对应环境变量，逗号分隔，可多个）
     bing     <- BING_API_KEYS    (+ 通用 SEARCH_API_KEYS)
     brave    <- BRAVE_API_KEYS   (+ 通用 SEARCH_API_KEYS)
     tavily   <- TAVILY_API_KEYS  (+ 通用 SEARCH_API_KEYS)
-    ddg      <- 无需 key
+    ddg / bing_web / so_web / quark / shenma / so_m / sogou_wx / toutiao / free <- 无需 key
 外加 key_file（每行一个 key）始终加载。
 """
 
@@ -46,13 +46,22 @@ from .search import SearchTool
 
 # 后端 -> 对应 API key 环境变量（通用 SEARCH_API_KEYS 作为兜底始终参与）
 _BACKEND_ENV_VARS = {
-    "serper": ("SERPER_API_KEYS", "SEARCH_API_KEYS"),
-    "serpapi": ("SERPAPI_API_KEYS", "SEARCH_API_KEYS"),
-    "bing": ("BING_API_KEYS", "SEARCH_API_KEYS"),
-    "brave": ("BRAVE_API_KEYS", "SEARCH_API_KEYS"),
-    "tavily": ("TAVILY_API_KEYS", "SEARCH_API_KEYS"),
-    # ddg 免费，不需要 key
+    "serper": ("SERPER_API_KEYS", "SERPER_API_KEY", "SEARCH_API_KEYS"),
+    "serpapi": ("SERPAPI_API_KEYS", "SERPAPI_API_KEY", "SEARCH_API_KEYS"),
+    "bing": ("BING_API_KEYS", "BING_API_KEY", "SEARCH_API_KEYS"),
+    "brave": ("BRAVE_API_KEYS", "BRAVE_API_KEY", "SEARCH_API_KEYS"),
+    "tavily": ("TAVILY_API_KEYS", "TAVILY_API_KEY", "SEARCH_API_KEYS"),
+    # 免费网页搜索，不需要 key。free 会按顺序换引擎。
     "ddg": (),
+    "bing_web": (),
+    "so_web": (),
+    "quark": (),
+    "shenma": (),
+    "so_m": (),
+    "sogou_wx": (),
+    "toutiao": (),
+    # free 链的第一个引擎是 Tavily，需要把它的 key 放进轮换池。
+    "free": ("TAVILY_API_KEYS", "TAVILY_API_KEY"),
 }
 
 

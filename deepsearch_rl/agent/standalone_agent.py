@@ -75,7 +75,7 @@ class StandaloneAgent:
         open_tool: Any,
         tokenizer: Any = None,
         *,
-        max_turns: int = 6,
+        max_turns: int = 12,
         max_parallel_calls: int = 3,
         obs_max_chars: int = 2000,
     ) -> None:
@@ -195,7 +195,7 @@ class OpenAICompatAgent(StandaloneAgent):
         temperature: float = 0.0,
         max_tokens: Optional[int] = 4096,
         tokenizer: Any = None,
-        max_turns: int = 6,
+        max_turns: int = 12,
         max_parallel_calls: int = 3,
         obs_max_chars: int = 2000,
         client: Any = None,
@@ -228,6 +228,8 @@ class OpenAICompatAgent(StandaloneAgent):
             messages=messages,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            # 与训练一致：Qwen3 关闭 thinking，否则 <think> 会打乱 search/answer 协议
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         return resp.choices[0].message.content or ""
 

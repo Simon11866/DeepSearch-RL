@@ -1,0 +1,528 @@
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 5a699da0..2988b3bb 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -18,6 +18,7 @@ import os
+ import queue
+ import random
+ import threading
++import time
+ from abc import ABC, abstractmethod
+ from concurrent.futures import Future
+ from typing import Any, Optional
+@@ -780,10 +781,28 @@ class AgentLoopManager:
+ 
+         self._initialize_llm_servers()
+         self._init_agent_loop_workers()
+-
+-        # Initially we're in sleep mode.
++        # 先等 HTTP 就绪再 sleep，把 SGLang 权重让出来。否则下一步 FSDP state_dict
++        # 和 SGLang 挤在同一张 24GB 上，clone 分片时 OOM。
+         if self.config.actor_rollout_ref.rollout.free_cache_engine:
+-            self.sleep()
++            self._sleep_when_ready()
++
++    def _sleep_when_ready(self, attempts: int = 40, delay_s: float = 5.0) -> None:
++        """Retry SGLang release until the HTTP server accepts it.
++
++        A TCP /health probe can miss the real listen address. The engine client
++        used by sleep() is the same path later rollout uses.
++        """
++        last_err: Exception | None = None
++        for i in range(attempts):
++            try:
++                self.sleep()
++                logger.warning("SGLang sleep succeeded on attempt %s", i + 1)
++                return
++            except Exception as exc:
++                last_err = exc
++                logger.warning("SGLang sleep not ready (attempt %s): %s", i + 1, exc)
++                time.sleep(delay_s)
++        raise RuntimeError(f"SGLang sleep failed after {attempts} attempts: {last_err}")
+ 
+     def _initialize_llm_servers(self):
+         rollout_world_size = (
+@@ -850,6 +869,8 @@ class AgentLoopManager:
+             )
+         if self.config.actor_rollout_ref.rollout.free_cache_engine:
+             self.wake_up()
++            # SGLang HTTP 在 resume 后需要短暂就绪，否则第一轮 generate 会打到未监听端口
++            time.sleep(2)
+         chunkes = prompts.chunk(len(self.agent_loop_workers))
+         outputs = ray.get(
+             [
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index b1724e4d..b858cd79 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -199,6 +199,13 @@ trainer:
+   # Validation frequency (in training iterations)
+   test_freq: -1
+ 
++  # Stop after this many consecutive validations without improvement.
++  # 0 disables early stopping.
++  early_stop_patience: 0
++
++  # Minimum absolute gain in the mean val-core score to count as improvement.
++  early_stop_min_delta: 0.01
++
+   # Number of iterations to warm up the critic before updating policy
+   critic_warmup: 0
+ 
+diff --git a/verl/trainer/constants_ppo.py b/verl/trainer/constants_ppo.py
+index 30e32524..95ea093a 100644
+--- a/verl/trainer/constants_ppo.py
++++ b/verl/trainer/constants_ppo.py
+@@ -20,6 +20,12 @@ from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
+ PPO_RAY_RUNTIME_ENV = {
+     "env_vars": {
+         "TOKENIZERS_PARALLELISM": "true",
++        # 容器有 96 核。默认 OpenMP 会按核数起线程，ray.put 时多个进程一起 consolidate
++        # 会打满 cgroup，libgomp 报 Thread creation failed 然后段错误。
++        "OMP_NUM_THREADS": "1",
++        "MKL_NUM_THREADS": "1",
++        "OPENBLAS_NUM_THREADS": "1",
++        "NUMEXPR_NUM_THREADS": "1",
+         "NCCL_DEBUG": "WARN",
+         "VLLM_LOGGING_LEVEL": "WARN",
+         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 61b710c3..5ccd66ee 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
+ 
+ import json
+ import os
++import shutil
+ import uuid
+ from collections import defaultdict
+ from copy import deepcopy
+@@ -659,6 +660,63 @@ class RayPPOTrainer:
+ 
+         return metric_dict
+ 
++    def _validation_plateau_score(self, val_metrics: dict) -> Optional[float]:
++        """Average the val-core mean reward/accuracy across data sources."""
++        values = []
++        for key, value in val_metrics.items():
++            key = str(key)
++            if not key.startswith("val-core/"):
++                continue
++            if "/reward/" not in key and "/acc/" not in key:
++                continue
++            if "/mean@" not in key and not key.endswith("/mean"):
++                continue
++            try:
++                values.append(float(value))
++            except (TypeError, ValueError):
++                continue
++        if not values:
++            return None
++        return sum(values) / len(values)
++
++    def _note_validation_for_early_stop(self, val_metrics: dict) -> bool:
++        """Return True when recent validations have stopped improving.
++
++        The first call records the baseline. Later calls count a stall when the
++        score does not beat the best by ``early_stop_min_delta``. Training stops
++        after ``early_stop_patience`` stalls in a row. Patience 0 disables this.
++        """
++        patience = int(self.config.trainer.get("early_stop_patience", 0) or 0)
++        min_delta = float(self.config.trainer.get("early_stop_min_delta", 0.01) or 0.0)
++        score = self._validation_plateau_score(val_metrics)
++        if score is None:
++            print("Early stop skipped: no val-core mean reward/acc in validation metrics.")
++            return False
++        val_metrics["val/plateau_score"] = score
++        if not hasattr(self, "_eval_best"):
++            self._eval_best = float("-inf")
++            self._eval_stall = 0
++        if score > self._eval_best + min_delta:
++            self._eval_best = score
++            self._eval_stall = 0
++            improved = True
++        else:
++            self._eval_stall += 1
++            improved = False
++        val_metrics["val/early_stop_stall"] = self._eval_stall
++        val_metrics["val/early_stop_best"] = self._eval_best
++        print(
++            f"Validation plateau score={score:.4f} best={self._eval_best:.4f} "
++            f"stall={self._eval_stall}/{patience} improved={improved}"
++        )
++        if patience > 0 and self._eval_stall >= patience:
++            print(
++                f"Validation stable for {patience} evals "
++                f"(delta <= {min_delta}). Stopping training."
++            )
++            return True
++        return False
++
+     def init_workers(self):
+         """Initialize distributed training workers using Ray backend.
+ 
+@@ -765,6 +823,44 @@ class RayPPOTrainer:
+                 config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
+             )
+ 
++    def _checkpoint_root(self) -> str:
++        ckpt_root = self.config.trainer.default_local_dir
++        if not os.path.isabs(ckpt_root):
++            ckpt_root = os.path.join(os.getcwd(), ckpt_root)
++        return ckpt_root
++
++    def _prune_local_checkpoints(self, keep_latest: int, protect_step: Optional[int] = None):
++        """Delete old ``global_step_*`` directories so at most ``keep_latest`` remain.
++
++        The actor manager only remembers paths saved in this process and only removes the
++        ``actor/`` subdirectory. ``data.pt`` and checkpoints from a previous process would
++        otherwise stay on disk. A 50GB data disk cannot hold two FSDP model shards, so old
++        copies are removed before the new one is written.
++        """
++        if not isinstance(keep_latest, int) or keep_latest < 0:
++            return
++        ckpt_root = self._checkpoint_root()
++        if not os.path.isdir(ckpt_root):
++            return
++
++        found = []
++        for name in os.listdir(ckpt_root):
++            if not name.startswith("global_step_"):
++                continue
++            suffix = name[len("global_step_") :]
++            if not suffix.isdigit():
++                continue
++            found.append((int(suffix), os.path.join(ckpt_root, name)))
++        found.sort()
++
++        protected = [path for step, path in found if protect_step is not None and step == protect_step]
++        victims = [path for step, path in found if path not in protected]
++        quota = max(0, keep_latest - len(protected))
++        stale = victims if quota == 0 else victims[: max(0, len(victims) - quota)]
++        for path in stale:
++            print(f"Removing old checkpoint (keep {keep_latest}): {path}")
++            shutil.rmtree(path, ignore_errors=True)
++
+     def _save_checkpoint(self):
+         from verl.utils.fs import local_mkdir_safe
+ 
+@@ -795,6 +891,11 @@ class RayPPOTrainer:
+             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+         )
+ 
++        # Free the previous full checkpoint before writing. keep=1 means delete every
++        # existing global_step_* first; two model shards do not fit on the data disk.
++        if isinstance(max_actor_ckpt_to_keep, int) and max_actor_ckpt_to_keep > 0:
++            self._prune_local_checkpoints(keep_latest=max_actor_ckpt_to_keep - 1)
++
+         self.actor_rollout_wg.save_checkpoint(
+             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+         )
+@@ -823,6 +924,11 @@ class RayPPOTrainer:
+         with open(local_latest_checkpointed_iteration, "w") as f:
+             f.write(str(self.global_steps))
+ 
++        if isinstance(max_actor_ckpt_to_keep, int) and max_actor_ckpt_to_keep > 0:
++            self._prune_local_checkpoints(
++                keep_latest=max_actor_ckpt_to_keep, protect_step=self.global_steps
++            )
++
+     def _load_checkpoint(self):
+         if self.config.trainer.resume_mode == "disable":
+             return 0
+@@ -962,6 +1068,16 @@ class RayPPOTrainer:
+         # Return unchanged batch and empty metrics if IS is disabled
+         return batch, {}
+ 
++    def _ensure_search_engine(self) -> None:
++        """本步开始前确认搜索引擎可用。不可用则由检索服务切换，全部不可用就不开始这一步。"""
++        from deepsearch_rl.retrieval.ready import ensure_search_ready
++
++        info = ensure_search_ready()
++        print(
++            f"[search] step={self.global_steps} backend={info.get('backend')} "
++            f"switched={info.get('switched')} attempts={info.get('attempts')}"
++        )
++
+     def fit(self):
+         """
+         The training loop of PPO.
+@@ -990,6 +1106,7 @@ class RayPPOTrainer:
+         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+             val_metrics = self._validate()
+             assert val_metrics, f"{val_metrics=}"
++            self._note_validation_for_early_stop(val_metrics)
+             pprint(f"Initial validation metrics: {val_metrics}")
+             logger.log(data=val_metrics, step=self.global_steps)
+             if self.config.trainer.get("val_only", False):
+@@ -1195,6 +1312,7 @@ class RayPPOTrainer:
+                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+ 
+                 # validate
++                stop_for_stable_eval = False
+                 if (
+                     self.val_reward_fn is not None
+                     and self.config.trainer.test_freq > 0
+@@ -1204,6 +1322,7 @@ class RayPPOTrainer:
+                         val_metrics: dict = self._validate()
+                         if is_last_step:
+                             last_val_metrics = val_metrics
++                        stop_for_stable_eval = self._note_validation_for_early_stop(val_metrics)
+                     metrics.update(val_metrics)
+ 
+                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+@@ -1268,6 +1387,11 @@ class RayPPOTrainer:
+                 progress_bar.update(1)
+                 self.global_steps += 1
+ 
++                if stop_for_stable_eval:
++                    pprint(f"Stopped early: validation stable. Last metrics: { {k: metrics[k] for k in metrics if str(k).startswith('val/')} }")
++                    progress_bar.close()
++                    return
++
+                 if (
+                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
+                     and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+diff --git a/verl/utils/ray_utils.py b/verl/utils/ray_utils.py
+index a738c0f3..d43cb9dc 100644
+--- a/verl/utils/ray_utils.py
++++ b/verl/utils/ray_utils.py
+@@ -64,7 +64,8 @@ def parallel_put(data_list: list[Any], max_workers: Optional[int] = None):
+         return index, ray.put(data)
+ 
+     if max_workers is None:
+-        max_workers = min(len(data_list), 16)
++        # 每个 put 都会 consolidate 一大块张量。16 路并发会在 96 核上把线程打满。
++        max_workers = min(len(data_list), 4)
+ 
+     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+         data_list_f = [executor.submit(put_data, i, data) for i, data in enumerate(data_list)]
+diff --git a/verl/utils/torch_functional.py b/verl/utils/torch_functional.py
+index e644894d..9c218d2e 100644
+--- a/verl/utils/torch_functional.py
++++ b/verl/utils/torch_functional.py
+@@ -122,15 +122,41 @@ def logprobs_from_logits_v2(logits: torch.FloatTensor, labels):
+         # loop to reduce peak mem consumption
+         logsumexp_values = torch.stack([torch.logsumexp(logit, dim=-1) for logit in logits])
+         logprobs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
++        return logprobs_labels
++
++    # Do not reshape/contiguous the full [*, vocab] tensor: that copy OOMs on 24GB hybrid.
++    orig_shape = labels.shape
++    vocab = logits.shape[-1]
++    lead = int(labels.numel())
++    out = torch.empty(lead, device=logits.device, dtype=logits.dtype)
++    chunk = 8
++    try:
++        flat_logits = logits.view(lead, vocab)
++        flat_labels = labels.view(lead)
++    except RuntimeError:
++        flat_logits = None
++    if flat_logits is not None:
++        for i in range(0, lead, chunk):
++            sl = slice(i, min(i + chunk, lead))
++            lp = F.log_softmax(flat_logits[sl].float(), dim=-1)
++            out[sl] = lp.gather(dim=-1, index=flat_labels[sl].unsqueeze(-1)).squeeze(-1).to(dtype=logits.dtype)
++            del lp
+     else:
+-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
+-        logprobs_labels = []
+-        for row_logits, row_labels in zip(logits, labels, strict=True):  # loop to reduce peak mem consumption
+-            row_logprobs = F.log_softmax(row_logits, dim=-1)
+-            row_logprobs_labels = row_logprobs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
+-            logprobs_labels.append(row_logprobs_labels)
+-        logprobs_labels = torch.stack(logprobs_labels)
+-    return logprobs_labels
++        # [B, S, V] typical path: last dim is contiguous, slice without a full copy.
++        assert logits.dim() == 3 and labels.dim() == 2, logits.shape
++        bsz, seq, _ = logits.shape
++        pos = 0
++        for b in range(bsz):
++            for s in range(0, seq, chunk):
++                e = min(s + chunk, seq)
++                n = e - s
++                lp = F.log_softmax(logits[b, s:e].float(), dim=-1)
++                out[pos : pos + n] = (
++                    lp.gather(dim=-1, index=labels[b, s:e].unsqueeze(-1)).squeeze(-1).to(dtype=logits.dtype)
++                )
++                pos += n
++                del lp
++    return out.view(orig_shape)
+ 
+ 
+ def clip_by_value(x, tensor_min, tensor_max):
+@@ -143,10 +169,24 @@ def clip_by_value(x, tensor_min, tensor_max):
+ 
+ 
+ def entropy_from_logits(logits: torch.Tensor):
+-    """Calculate entropy from logits."""
+-    pd = torch.nn.functional.softmax(logits, dim=-1)
+-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+-    return entropy
++    """Calculate entropy without a full [*, vocab] reshape/copy."""
++    orig_shape = logits.shape[:-1]
++    lead = int(logits.numel() // logits.shape[-1])
++    vocab = logits.shape[-1]
++    try:
++        flat = logits.view(lead, vocab)
++        return entropy_from_logits_with_chunking(flat, chunk_size=8).view(*orig_shape)
++    except RuntimeError:
++        assert logits.dim() == 3
++        bsz, seq, _ = logits.shape
++        ent = torch.empty((bsz, seq), device=logits.device, dtype=logits.dtype)
++        for b in range(bsz):
++            for s in range(0, seq, 8):
++                e = min(s + 8, seq)
++                chunk = logits[b, s:e].float()
++                pd = torch.nn.functional.softmax(chunk, dim=-1)
++                ent[b, s:e] = (torch.logsumexp(chunk, dim=-1) - torch.sum(pd * chunk, dim=-1)).to(dtype=logits.dtype)
++        return ent
+ 
+ 
+ def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index f7823310..6a98253c 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -260,7 +260,7 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+                 else:
+                     logits = output.logits
+-
++                    del output
+                     logits.div_(temperature)
+                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+@@ -269,6 +269,7 @@ class DataParallelPPOActor(BasePPOActor):
+                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                         else:
+                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
++                    del logits
+ 
+             return entropy, log_probs
+ 
+@@ -290,7 +291,19 @@ class DataParallelPPOActor(BasePPOActor):
+             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+             self.actor_optimizer.zero_grad()
+         else:
+-            self.actor_optimizer.step()
++            # 24GB 上参数+梯度已经占满，Adam 的 fp32 状态放在 CPU 上更新。
++            if isinstance(self.actor_module, FSDP):
++                from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
++
++                offload_fsdp_model_to_cpu(self.actor_module, empty_cache=True)
++                for group in self.actor_optimizer.param_groups:
++                    for param in group["params"]:
++                        if param.grad is not None and param.grad.is_cuda:
++                            param.grad = param.grad.detach().to("cpu")
++                self.actor_optimizer.step()
++                load_fsdp_model_to_gpu(self.actor_module)
++            else:
++                self.actor_optimizer.step()
+         return grad_norm
+ 
+     @GPUMemoryLogger(role="dp actor", logger=logger)
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index a31c575e..d12df6ab 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -43,6 +43,17 @@ try:
+ except ImportError:
+     from torch.distributed._tensor import DTensor
+ 
++
++def _hf_attn_implementation() -> str:
++    """4090 环境默认走 SDPA；装了 flash_attn 才用 FA2。"""
++    try:
++        import importlib.metadata as importlib_metadata
++
++        importlib_metadata.version("flash_attn")
++        return "flash_attention_2"
++    except importlib_metadata.PackageNotFoundError:
++        return "sdpa"
++
+ import verl.utils.torch_functional as verl_F
+ from verl import DataProto
+ from verl.models.transformers.monkey_patch import apply_monkey_patch
+@@ -316,7 +327,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         # override model kwargs
+         actor_model_config = AutoConfig.from_pretrained(
+-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
++            local_path, trust_remote_code=trust_remote_code, attn_implementation=_hf_attn_implementation()
+         )
+         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
+         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
+@@ -851,8 +862,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         assert self._is_actor
+         if self._is_offload_param:
+             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+-        if self._is_offload_optimizer:
+-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
++        # Adam 状态留在 CPU。这里再 load 回 GPU 会在 step 时多占一块显存。
+ 
+         with self.ulysses_sharding_manager:
+             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+@@ -961,12 +971,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+         data.meta_info["temperature"] = self.config.rollout.temperature
++        calculate_entropy = float(self.config.actor.get("entropy_coeff", 0.0) or 0.0) != 0.0
+         # perform recompute log_prob
+         with self.ulysses_sharding_manager:
+             with adapter_ctx:
+-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
++                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
++            tensors = {"old_log_probs": output}
++            if entropys is not None:
++                tensors["entropys"] = entropys
++            else:
++                tensors["entropys"] = torch.zeros_like(output)
+             output = DataProto.from_dict(
+-                tensors={"old_log_probs": output, "entropys": entropys},
++                tensors=tensors,
+                 meta_info={"temperature": self.config.rollout.temperature},
+             )
+ 
+@@ -1233,7 +1249,7 @@ class CriticWorker(Worker, DistProfilerExtension):
+ 
+         critic_model_config = AutoConfig.from_pretrained(
+             local_path,
+-            attn_implementation="flash_attention_2",
++            attn_implementation=_hf_attn_implementation(),
+             trust_remote_code=config.model.get("trust_remote_code", False),
+         )
+         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
+@@ -1634,7 +1650,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+                 pretrained_model_name_or_path=local_path,
+                 config=model_config,
+                 torch_dtype=torch.bfloat16,
+-                attn_implementation="flash_attention_2",
++                attn_implementation=_hf_attn_implementation(),
+                 trust_remote_code=trust_remote_code,
+             )
+ 
+diff --git a/verl/workers/rollout/utils.py b/verl/workers/rollout/utils.py
+index 575c98d6..5c81a288 100644
+--- a/verl/workers/rollout/utils.py
++++ b/verl/workers/rollout/utils.py
+@@ -54,9 +54,15 @@ async def run_unvicorn(app: FastAPI, server_args, server_address, max_retries=5)
+             app.server_args = server_args
+             config = uvicorn.Config(app, host=server_address, port=server_port, log_level="warning")
+             server = uvicorn.Server(config)
+-            server.should_exit = True
+-            await server.serve()
+-            server_task = asyncio.create_task(server.main_loop())
++            # should_exit=True makes serve() return before it accepts connections,
++            # so later release/resume HTTP calls get connection refused.
++            server_task = asyncio.create_task(server.serve(sockets=[sock]))
++            for _ in range(100):
++                if getattr(server, "started", False):
++                    break
++                await asyncio.sleep(0.1)
++            else:
++                raise OSError(f"uvicorn did not start on {server_address}:{server_port}")
+             break
+         except (OSError, SystemExit) as e:
+             logger.error(f"Failed to start HTTP server on port {server_port} at try {i}, error: {e}")

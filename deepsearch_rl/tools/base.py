@@ -44,6 +44,10 @@ class BaseTool(abc.ABC):
     def __init__(self, cache: Optional[PersistentToolCache] = None) -> None:
         self.cache = cache
 
+    def cache_namespace(self) -> str:
+        """缓存分区。搜索按后端分开，避免换引擎后读到旧结果。"""
+        return self.name
+
     @abc.abstractmethod
     def _run(self, argument: str) -> str:
         """子类实现：真正调用外部服务，返回拼进 observation 的文本；失败抛 ToolError。"""
@@ -54,7 +58,7 @@ class BaseTool(abc.ABC):
         start = time.time()
         # 1. 命中缓存
         if self.cache is not None:
-            cached = self.cache.get(self.name, argument)
+            cached = self.cache.get(self.cache_namespace(), argument)
             if cached is not None:
                 return ToolResult(
                     name=self.name,
@@ -79,7 +83,7 @@ class BaseTool(abc.ABC):
             )
         # 3. 写缓存
         if self.cache is not None and content:
-            self.cache.set(self.name, argument, content)
+            self.cache.set(self.cache_namespace(), argument, content)
         return ToolResult(
             name=self.name,
             argument=argument,

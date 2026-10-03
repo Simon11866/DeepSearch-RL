@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -27,6 +28,8 @@ import sys
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+
+os.environ["DEEPSEARCH_DISABLE_JUDGE"] = "1"
 
 from deepsearch_rl.protocol import build_observation  # noqa: E402
 from deepsearch_rl.rewards.hierarchical import compute_score_sync  # noqa: E402
@@ -104,8 +107,9 @@ def test_correct_without_evidence() -> dict:
     assert res["r_answer"] == 1.0
     assert res["r_evidence"] == 0.0, f"无观测时代理应 0，实际 {res['r_evidence']}"
     assert res["r_tool"] == 0.0, f"无工具调用时 R_tool 应为 0，实际 {res['r_tool']}"
-    # 0.2 + 1.0*(0.2+0) + 0 + 0 = 0.4
-    assert abs(res["score"] - 0.4) < 1e-6, f"总分应为 0.4，实际 {res['score']}"
+    # 格式 0.2，答案分因未搜索被门控掉，再扣 undersearch 0.5 → -0.3
+    assert res["score"] < 0, f"不搜索的正确答案必须为负分，实际 {res['score']}"
+    assert abs(res["score"] - (-0.3)) < 1e-6, f"总分应为 -0.3，实际 {res['score']}"
     print("[ok] test_correct_without_evidence")
     return res
 
@@ -120,7 +124,40 @@ def test_gate_gap() -> None:
     print("[ok] test_gate_gap")
 
 
+def test_train_tool_text_counts_as_evidence() -> None:
+    """训练工具返回必须包进 observation，否则证据分恒为 0。"""
+    from verl.tools.schemas import OpenAIFunctionSchema, OpenAIFunctionToolSchema
+
+    from deepsearch_rl.tools.verl_wrappers import SearchToolWrapper
+
+    schema = OpenAIFunctionToolSchema(
+        type="function",
+        function=OpenAIFunctionSchema(name="search", description="search"),
+    )
+    wrapper = SearchToolWrapper(
+        config={"retrieval_service_url": "http://127.0.0.1:9"},
+        tool_schema=schema,
+    )
+
+    async def _fake_search(query: str) -> str:
+        return f"对查询「{query}」的结果：巴黎是法国的首都。"
+
+    wrapper._call_http = _fake_search  # type: ignore[method-assign]
+    resp, reward, metrics = asyncio.run(
+        wrapper.execute(parameters={"query": "法国首都"})
+    )
+    assert reward == 0.0
+    assert metrics["source"] == "http"
+    solution = "<search>法国首都</search>\n" + resp.text + "\n<answer>巴黎</answer>"
+    res = compute_score_sync("hotpotqa", solution, {"target": ["巴黎"]}, {})
+    assert "<observation>" in resp.text
+    assert res["num_search"] == 1
+    assert res["r_evidence"] == 0.6, f"工具正文应计入证据，实际 {res['r_evidence']}"
+    print("[ok] test_train_tool_text_counts_as_evidence")
+
+
 if __name__ == "__main__":
     test_answer_metrics()
     test_gate_gap()
+    test_train_tool_text_counts_as_evidence()
     print("\n全部离线逻辑测试通过 ✅")

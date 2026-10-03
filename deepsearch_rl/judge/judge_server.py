@@ -88,8 +88,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as exc:
-        print(f"[judge_server] vllm 异常退出，code={exc.return_code}", file=sys.stderr)
-        return exc.return_code
+        print(f"[judge_server] vllm 异常退出，code={exc.returncode}", file=sys.stderr)
+        return exc.returncode
     return 0
 
 

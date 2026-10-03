@@ -6,8 +6,7 @@
 #   bash scripts/start_retrieval.sh
 #
 # 常用环境变量（均有缺省值，可按需覆盖）：
-#   SEARCH_BACKEND         搜索后端：serper/serpapi/bing/brave/tavily/ddg
-#                          默认 serper；未配置任何 key 时服务会自动回退 ddg。
+#   SEARCH_BACKEND         搜索后端。默认 free：quark/so_m/shenma/sogou_wx/toutiao 依次切换。
 #   SEARCH_API_KEYS / SERPER_API_KEYS / SERPAPI_API_KEYS / BING_API_KEYS /
 #   BRAVE_API_KEYS / TAVILY_API_KEYS   逗号分隔的 API key。
 #   KEY_FILE               API key 文件（每行一个，# 开头为注释）。
@@ -18,8 +17,16 @@
 # =============================================================================
 set -e
 
+cd "$(dirname "$0")/.."
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 # ---- 配置（带缺省值）----
-export SEARCH_BACKEND="${SEARCH_BACKEND:-serper}"
+export SEARCH_BACKEND="${SEARCH_BACKEND:-free}"
 export RETRIEVAL_PORT="${RETRIEVAL_PORT:-8000}"
 export RETRIEVAL_CONCURRENCY="${RETRIEVAL_CONCURRENCY:-120}"
 export CACHE_DB_PATH="${CACHE_DB_PATH:-$HOME/.cache/deepsearch_rl/tool_cache.db}"

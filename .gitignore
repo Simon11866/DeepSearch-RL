@@ -11,12 +11,14 @@ venv/
 env/
 
 # ---- 数据 / 模型（大文件不进仓库）----
+# 处理后的训练集、验证集和冻结的 500 题题目可以入库。
+# 500 题评测结果在 outputs/，不要入库。
 data/raw/
-data/processed/
 data/parquet/
 data/*.parquet
 data/*.jsonl
 !data/*.example.jsonl
+!data/eval_hard_500.jsonl
 models/
 checkpoints/
 *.bin
@@ -26,7 +28,9 @@ checkpoints/
 *.index
 
 # ---- 实验 / 日志 ----
-logs/
+# 训练日志入库；评测日志、检索日志、推理日志和 outputs/ 里的 500 题结果不入库。
+logs/*
+!logs/train*.log
 outputs/
 .swancb/
 swanlog/
@@ -34,6 +38,7 @@ wandb/
 ray/
 /tmp/
 *.log
+!logs/train*.log
 
 # ---- 密钥 / 本地配置 ----
 .env

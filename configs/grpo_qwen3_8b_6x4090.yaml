@@ -1,0 +1,191 @@
+# =============================================================================
+# DeepSearch-RL 主训练配置：Qwen3-8B / veRL / SGLang / GRPO，默认适配 6×RTX 4090
+#
+# 本文件是「可读的嵌套配置」，train_grpo.py 会将其拍平为 Hydra dotlist 覆盖
+# veRL 内置 ppo_trainer 配置。命令行可用 key=value 追加/覆盖（同官方用法）。
+#
+# 硬件口径：6×RTX 4090（24GB / Ada sm_89）。注意 4090 与 5090(Blackwell 32GB)
+#           显存差 8GB/卡，因此本配置按「显存紧张」档下调了 batch 与 token 预算
+#           （参照 README「十三、显存与调参」）。若换 5090 可相应上调。
+#
+# 关键口径：
+#   data.train_batch_size=48，rollout.n=5 → 48×5 = 240 条轨迹 / step
+#   6h 快训：1728 条难多跳（data/processed/fast），total_training_steps=36
+#   actor.use_dynamic_bsz=True → 动态 sequence balancing（token 负载 52.8%→0.06%）
+#
+# 6 卡并行：tensor_model_parallel_size(2) × data_parallel_size(3) = 6 GPU
+# 显存若仍有富余可上调：data.train_batch_size=56/84、ppo_micro_batch_size_per_gpu=3/4、
+#                       gpu_memory_utilization=0.55。
+# =============================================================================
+
+# Ray 不要按容器 96 核预拉 96 个 worker，否则启动极慢且容易把 raylet 打崩
+ray_kwargs:
+  ray_init:
+    num_cpus: 32
+
+# ---- 模型路径（由环境变量 MODEL_PATH 注入，或在 train.sh 里用 key=value 覆盖）----
+
+trainer:
+  total_epochs: 1
+  total_training_steps: 36      # 1728/48=36，约 6 小时墙钟（难多跳快训）
+  n_gpus_per_node: 6
+  nnodes: 1
+  save_freq: 3                      # 每 3 步存一次，只留最新 1 份
+  test_freq: 3                      # 每 3 步在验证集上评一次
+  val_before_train: true            # 训练开始前先评一次
+  # 连续 3 次评测的 val-core 平均分涨幅都 < 0.01 就停。
+  # 计分从开训前那一次开始，最早在第 9 步停。
+  early_stop_patience: 3
+  early_stop_min_delta: 0.01
+  val_only: false
+  project_name: deepsearch-rl
+  experiment_name: qwen3-8b-grpo-search-v7
+  logger:
+    - console
+    - swanlab
+  # 数据盘只放得下一份 FSDP。从原模型开训，第 3 步保存前会删掉这里已有的断点。
+  default_local_dir: checkpoints/deepsearch-rl/qwen3-8b
+  resume_mode: disable
+  # 数据盘 50GB，FSDP 模型分片约 29GB。只留 1 份，写新断点前先删旧的。
+  max_actor_ckpt_to_keep: 1
+
+data:
+  # 6h 快训子集（prepare_train.py --fast）：难多跳 1728 条，不含 NQ
+  train_files:
+    - data/processed/fast/train/hotpotqa.parquet
+    - data/processed/fast/train/2wiki.parquet
+    - data/processed/fast/train/musique.parquet
+  val_files:
+    - data/processed/fast/val/hotpotqa.parquet
+    - data/processed/fast/val/2wiki.parquet
+    - data/processed/fast/val/musique.parquet
+  prompt_key: prompt
+  reward_fn_key: data_source
+  train_batch_size: 48          # 48 prompts / step；36 step 扫完 1728 条
+  val_batch_size: 48
+  max_prompt_length: 512
+  max_response_length: 1024         # 2048 时 actor backward 还差约 1.7GB
+  return_raw_chat: true
+  shuffle: true
+  dataloader_num_workers: 4
+  filter_overlong_prompts: false   # prompt 远小于 1024，跳过 30 万条 tokenize 过滤以加快启动
+  truncation: left
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: ${oc.env:MODEL_PATH}
+    enable_gradient_checkpointing: true
+    use_liger: true
+    trust_remote_code: false
+  rollout:
+    name: sglang
+    mode: async
+    n: 4                        # 48×4=192 条轨迹；4×48/6=32，可被 micro bsz=2 整除
+    temperature: 1.0
+    top_p: 0.95
+    top_k: -1
+    dtype: bfloat16
+    tensor_model_parallel_size: 2
+    data_parallel_size: 1
+    gpu_memory_utilization: 0.50    # 仅 rollout 占用；free_cache_engine 会在 logprob 前 sleep 释放
+    max_num_batched_tokens: 4096
+    max_num_seqs: 64
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    enforce_eager: true            # 跳过 CUDA graph capture，加快启动
+    free_cache_engine: true        # rollout 结束后释放 SGLang 显存，否则 FSDP logprob 只剩几百 MB
+    skip_tokenizer_init: true
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 1536
+    log_prob_micro_batch_size_per_gpu: 1
+    engine_kwargs:
+      sglang:
+        attention_backend: flashinfer   # 4090 不能用 SGLang 默认 fa3
+    multi_turn:
+      enable: true
+      format: search_xml
+      max_assistant_turns: 8
+      max_user_turns: 8
+      max_parallel_calls: 2
+      max_tool_response_length: 512
+      tool_response_truncate_side: middle
+      tool_config_path: configs/tools_search_xml.yaml
+      tokenization_sanity_check_mode: ignore_strippable
+    agent:
+      num_workers: 16
+      default_agent_loop: deepsearch_agent
+      agent_loop_config_path: configs/agent_loops.yaml
+    val_kwargs:
+      temperature: 0
+      top_p: 1.0
+      top_k: -1
+      do_sample: false
+      n: 1
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 48     # 必须 <= data.train_batch_size；规范化后 48×n/6 需整除 micro bsz
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 1536   # 必须 >= prompt+response（512+1024）
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    ppo_epochs: 1
+    shuffle: true
+    entropy_coeff: 0.0              # 不在 logprob 再物化 vocab softmax，避免 24GB hybrid OOM
+    entropy_from_logits_with_chunking: true
+    entropy_checkpointing: true
+    clip_ratio: 0.2
+    grad_clip: 1.0
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+    # Adam 状态约 2×fp32（数十 GB），50GB 盘放不下。只存模型分片和 lr/RNG，
+    # 续训会恢复权重与步数，优化器动量从头开始。
+    checkpoint:
+      save_contents: ["model", "extra"]
+      load_contents: ["model", "extra"]
+    optim:
+      lr: 1.0e-6
+      weight_decay: 0.0
+      lr_warmup_steps_ratio: 0.1
+      lr_scheduler_type: constant
+  ref:
+    strategy: fsdp
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 1536
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  gamma: 1.0
+  lam: 1.0
+
+reward_model:
+  enable: false
+  enable_resource_pool: false
+
+custom_reward_function:
+  path: deepsearch_rl/rewards/hierarchical.py
+  name: compute_score_sync
+
+# -----------------------------------------------------------------------------
+# 以下为「非 veRL」段：train_grpo.py 读取后设置环境变量，不会传给 Hydra
+# -----------------------------------------------------------------------------
+# ---- 检索服务（供 wrapper 调用；与 start_retrieval.sh 端口保持一致）----
+retrieval:
+  service_url: http://127.0.0.1:8000
+  concurrency: 120
+# ---- 远程 Judge（DeepSeek API；密钥从 .env 的 DEEPSEEK_API_KEY 读取）----
+judge:
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-chat
+  sufficiency_threshold: 0.6
+  max_concurrency: 16
+  timeout: 120

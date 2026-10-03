@@ -22,7 +22,8 @@ veRL 自定义奖励入口：``custom_reward_function.path = deepsearch_rl/rewar
             + 0.3 * R_evidence * R_answer            # 正确且证据充分的联合奖励
             + R_tool
 
-量级参考：正确+充分≈1.6；正确但无证据(猜)≈0.4；错误≈0.2；无答案=0。
+量级参考：正确+充分≈1.6；搜过但证据不足的正确答案只拿格式分和答案门控下限；
+一次工具都不调用就作答（纯猜）再扣 undersearch_penalty，总分变为负，避免压过「去搜索」。
 
 **同步降级（必须）**：Judge 客户端构建失败（本地缺 openai/tenacity）或调用失败
 （服务不可达 / 返回非法 JSON）时，一律捕获异常并退回规则分——
@@ -38,12 +39,14 @@ veRL 自定义奖励入口：``custom_reward_function.path = deepsearch_rl/rewar
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
-from .answer_metrics import best_f1, em_match, normalize_answer
-from .tool_efficiency import ToolEfficiencyConfig, compute_tool_reward
-from ..agent.trajectory import TrajectoryAnalyzer
+# veRL 用 spec_from_file_location 把本文件当独立模块加载，相对导入会失败。
+from deepsearch_rl.rewards.answer_metrics import best_f1, em_match, normalize_answer
+from deepsearch_rl.rewards.tool_efficiency import ToolEfficiencyConfig, compute_tool_reward
+from deepsearch_rl.agent.trajectory import TrajectoryAnalyzer
 
 __all__ = ["RewardWeights", "compute_score", "compute_score_sync"]
 
@@ -67,6 +70,9 @@ class RewardWeights:
     joint_bonus: float = 0.3
     #: Answer Judge 判为 partial 时的得分
     partial_answer: float = 0.5
+    #: 整条轨迹没有任何 search/open 时的惩罚。必须大于格式分，
+    #: 否则「不搜直接猜对」会稳定高于「搜了但还没答对」。
+    undersearch_penalty: float = 0.5
 
 
 # 模块级默认配置（训练时通常不构造新实例，直接用默认值）
@@ -125,7 +131,9 @@ def _build_judge():
     刻意在函数内 import，保证本地无 openai 的环境也能 import 本模块、跑离线单测。
     """
     try:
-        from ..judge.judge_client import build_judge_client_from_env
+        if os.environ.get("DEEPSEARCH_DISABLE_JUDGE", "").strip() in {"1", "true", "True", "yes"}:
+            return None
+        from deepsearch_rl.judge.judge_client import build_judge_client_from_env
 
         return build_judge_client_from_env()
     except Exception:  # noqa: BLE001 - 构建失败即走规则降级
@@ -136,7 +144,7 @@ def _is_degraded_reason(reason: str) -> bool:
     """判断 Judge 返回的 reason 是否表明「服务不可达 / 非法 JSON」的降级结果。
 
     judge_client 在故障时不抛异常，而是返回最低分 verdict，并在 reason 里写明
-    "unreachable" / "invalid json" / "fallback"。据此识别后，我们改用规则分，
+    "unreachable" / "invalid JSON" / "fallback"。据此识别后，我们改用规则分，
     避免把「裁判挂了」误判成「答案错误」。
     """
     r = (reason or "").lower()
@@ -189,6 +197,11 @@ async def compute_score(
     extra_info: Optional[dict] = None,
 ) -> dict:
     """分层奖励主函数（veRL 异步入口）。"""
+    if extra_info is not None and not isinstance(extra_info, dict):
+        try:
+            extra_info = dict(extra_info)
+        except Exception:  # noqa: BLE001
+            extra_info = {}
     w = _DEFAULT_WEIGHTS
     gold = _coerce_gold(ground_truth)
     analyzer = TrajectoryAnalyzer.from_solution(solution_str)
@@ -252,12 +265,19 @@ async def compute_score(
     # ---- R_tool：工具效率奖励 -------------------------------------------
     r_tool, _tool_bd = compute_tool_reward(analyzer, r_evidence, _TOOL_CFG)
 
+    # 不调用任何 search/open 就结束：答案分不再计入，并额外扣分。
+    # 否则 Judge 把参数记忆判对时，纯猜（约 0.4）会压过仍在搜索的轨迹。
+    used_tools = analyzer.num_tool_calls > 0
+    answer_credit = r_answer if used_tools else 0.0
+    undersearch_penalty = 0.0 if used_tools else w.undersearch_penalty
+
     # ---- R_total：合成 ---------------------------------------------------
     r_total = (
         r_format
-        + r_answer * (w.answer_gate_floor + w.answer_gate_evidence * r_evidence)
-        + w.joint_bonus * r_evidence * r_answer
+        + answer_credit * (w.answer_gate_floor + w.answer_gate_evidence * r_evidence)
+        + w.joint_bonus * r_evidence * answer_credit
         + r_tool
+        - undersearch_penalty
     )
 
     return {

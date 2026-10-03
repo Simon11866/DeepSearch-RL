@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-远程 vLLM Judge 客户端
-=================================
+远程 Judge 客户端（OpenAI 兼容协议）
+====================================
 
-通过 OpenAI 兼容协议（``/v1/chat/completions``）调用独立部署的 vLLM Judge 服务。
+通过 ``/v1/chat/completions`` 调用裁判模型。默认走 DeepSeek 云端
+（``https://api.deepseek.com/v1`` / ``deepseek-chat``），也可指向本地 vLLM。
 
-对齐 ENGINEERING_SPEC 3.3 / 3.7：
-
-- 环境变量：``JUDGE_BASE_URL``（默认 ``http://127.0.0.1:8001/v1``）、
-  ``JUDGE_MODEL``（默认 ``Qwen/Qwen3-8B``）、``JUDGE_API_KEY``（默认 ``EMPTY``，
-  vLLM 本地服务不需要真实 key）。
-- 信号量限流（默认 64 并发）；tenacity 对网络 / 超时 / 5xx / 429 做指数退避重试，
-  参数类错误（400/422）不重试。
-- **容错约定**：连不上服务、重试耗尽、或模型返回非法 JSON 时，方法都不抛异常，
-  而是返回默认（最低分）verdict，保证奖励计算 / 训练主流程不中断。
+环境变量：
+``JUDGE_BASE_URL``、``JUDGE_MODEL``、``JUDGE_API_KEY`` / ``DEEPSEEK_API_KEY``。
 """
 
 from __future__ import annotations
@@ -187,9 +181,14 @@ class JudgeClient:
         self._sem = asyncio.Semaphore(max_concurrency)
         # api_key：vLLM 本地 OpenAI 兼容端点不校验，给占位符即可。
         # 关闭 openai 客户端自身重试，统一由 tenacity 控制。
+        api_key = (
+            os.environ.get("JUDGE_API_KEY")
+            or os.environ.get("DEEPSEEK_API_KEY")
+            or "EMPTY"
+        )
         self._client = AsyncOpenAI(
             base_url=base_url,
-            api_key=os.environ.get("JUDGE_API_KEY", "EMPTY"),
+            api_key=api_key,
             timeout=self.timeout,
             max_retries=0,
         )
@@ -208,12 +207,16 @@ class JudgeClient:
             with attempt:
                 # 信号量只包住真正的网络调用，退避等待期间不占用并发槽。
                 async with self._sem:
-                    resp = await self._client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=0.0,
-                        max_tokens=512,
-                    )
+                    create_kwargs = {
+                        "model": self.model,
+                        "messages": messages,
+                        "temperature": 0.0,
+                        "max_tokens": 512,
+                    }
+                    # DeepSeek / 多数 OpenAI 兼容端点支持 json_object，降低非法 JSON 降级率
+                    if "deepseek" in (self.base_url or "") or "deepseek" in (self.model or ""):
+                        create_kwargs["response_format"] = {"type": "json_object"}
+                    resp = await self._client.chat.completions.create(**create_kwargs)
                 return resp.choices[0].message.content or ""
         # 理论上不会走到这里（AsyncRetrying 耗尽会抛异常）
         raise RuntimeError("unreachable: retry loop exited without result")
@@ -312,15 +315,31 @@ class JudgeClient:
 def build_judge_client_from_env() -> JudgeClient:
     """从环境变量构造 :class:`JudgeClient`。
 
-    - ``JUDGE_BASE_URL``：默认 ``http://127.0.0.1:8001/v1``
-    - ``JUDGE_MODEL``：默认 ``Qwen/Qwen3-8B``
-    - ``JUDGE_MAX_CONCURRENCY``：默认 64
-    - ``JUDGE_TIMEOUT``：默认 60（秒）
+    - ``JUDGE_BASE_URL``：DeepSeek 为 ``https://api.deepseek.com/v1``；
+      本地 vLLM 为 ``http://127.0.0.1:8001/v1``
+    - ``JUDGE_MODEL``：DeepSeek 为 ``deepseek-chat``
+    - ``JUDGE_API_KEY`` / ``DEEPSEEK_API_KEY``：云端 API 密钥
+    - ``JUDGE_MAX_CONCURRENCY``：默认 16（云端限流更保守）
+    - ``JUDGE_TIMEOUT``：默认 120（秒）
     """
-    base_url = os.environ.get("JUDGE_BASE_URL", "http://127.0.0.1:8001/v1")
-    model = os.environ.get("JUDGE_MODEL", "Qwen/Qwen3-8B")
-    max_concurrency = int(os.environ.get("JUDGE_MAX_CONCURRENCY", "64"))
-    timeout = float(os.environ.get("JUDGE_TIMEOUT", "60"))
+    try:
+        from ..utils.config import load_dotenv
+
+        load_dotenv()
+    except Exception:  # noqa: BLE001
+        pass
+
+    has_deepseek = bool(
+        os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("JUDGE_API_KEY")
+    )
+    default_base = (
+        "https://api.deepseek.com/v1" if has_deepseek else "http://127.0.0.1:8001/v1"
+    )
+    default_model = "deepseek-chat" if has_deepseek else "Qwen/Qwen3-8B"
+    base_url = os.environ.get("JUDGE_BASE_URL", default_base)
+    model = os.environ.get("JUDGE_MODEL", default_model)
+    max_concurrency = int(os.environ.get("JUDGE_MAX_CONCURRENCY", "16"))
+    timeout = float(os.environ.get("JUDGE_TIMEOUT", "120"))
     return JudgeClient(
         base_url=base_url,
         model=model,

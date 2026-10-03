@@ -124,7 +124,7 @@ class PersistentToolCache:
     # ------------------------------------------------------------------
     @staticmethod
     def make_key(namespace: str, argument: str) -> str:
-        if namespace == "search":
+        if namespace == "search" or namespace.startswith("search:"):
             argument = _normalize_query(argument)
         elif namespace == "open":
             argument = _normalize_url(argument)

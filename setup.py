@@ -42,8 +42,7 @@ setup(
         "trafilatura>=1.12.0",
         "beautifulsoup4>=4.12.0",
         "lxml>=5.3.0",
-        # 注意：flash-attn / flashinfer / verl / sglang 需按 README 用特殊 index
-        # 或源码安装（见 scripts/install_autodl.sh），不放入标准依赖，避免 pip 编译失败。
+        "liger-kernel>=0.8.2",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

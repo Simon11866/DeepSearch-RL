@@ -23,7 +23,7 @@ tools:
       rate_limit: 120
       timeout: 30
       # 检索后端与条数（本地兜底模式才用到；HTTP 模式由服务端决定后端）
-      backend: serper
+      backend: free
       num_results: 5
     tool_schema:
       type: function

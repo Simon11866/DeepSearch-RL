@@ -16,20 +16,20 @@ model:
   endpoint: http://127.0.0.1:30000/v1
   name: default
 
-# 远程 Judge（Answer / Evidence），独立 vLLM 服务
+# 远程 Judge（Answer / Evidence），默认 DeepSeek API
 judge:
-  base_url: http://127.0.0.1:8001/v1
-  model: judge
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-chat
 
 # 检索工具（评测期 agent 直接调本地真实 search/open，含缓存/key 轮换/重试）
 search:
-  backend: ddg          # serper/serpapi/bing/brave/tavily/ddg
+  backend: free         # quark → so_m → shenma → sogou_wx → toutiao
   num_results: 5
   cache_enabled: true
 
 # 运行参数
 runtime:
-  max_turns: 6          # 每题最多检索轮次
+  max_turns: 12         # 每题最多检索轮次
   concurrency: 16       # 并发题数
   limit: null           # 调试用：只跑前 N 题；null = 全量 500
 

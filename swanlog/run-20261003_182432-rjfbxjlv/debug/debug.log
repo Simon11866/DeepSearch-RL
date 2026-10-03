@@ -1,0 +1,58 @@
+Diagnostic log bound to file: swanlog/run-20261003_182432-rjfbxjlv/debug/debug.log
+2026-10-03 21:26:17.434 | ERROR    | swanlab.sdk.internal.pkg.safe:block:101 - Failed to report run finish: Traceback (most recent call last):
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/pkg/safe/__init__.py", line 98, in block
+    yield
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/core_python/core.py", line 528, in _confirm_finish_when_enabled
+    stop_experiment(
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/core_python/api/experiment.py", line 97, in stop_experiment
+    client.put(
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/core_python/client/__init__.py", line 63, in put
+    return _get_client().put(url, data=data, retries=retries, log_error=log_error)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/pkg/client/__init__.py", line 113, in put
+    return self.request("PUT", url, json=data, retries=retries, log_error=log_error)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/pkg/client/__init__.py", line 103, in request
+    resp = self._session.request(method, full_url, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/pkg/client/session.py", line 92, in request
+    return super().request(method, url, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/requests/sessions.py", line 651, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/pkg/client/session.py", line 111, in send
+    response = super().send(request, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/requests/sessions.py", line 784, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/swanlab/sdk/internal/pkg/client/session.py", line 77, in send
+    return super().send(request, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/requests/adapters.py", line 696, in send
+    resp = conn.urlopen(
+           ^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/urllib3/connectionpool.py", line 790, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/urllib3/connectionpool.py", line 467, in _make_request
+    self._validate_conn(conn)
+  File "/root/miniconda3/lib/python3.12/site-packages/urllib3/connectionpool.py", line 1096, in _validate_conn
+    conn.connect()
+  File "/root/miniconda3/lib/python3.12/site-packages/urllib3/connection.py", line 642, in connect
+    sock_and_verified = _ssl_wrap_socket_and_match_hostname(
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/urllib3/connection.py", line 735, in _ssl_wrap_socket_and_match_hostname
+    context = create_urllib3_context(
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/urllib3/util/ssl_.py", line 345, in create_urllib3_context
+    context.hostname_checks_common_name = False
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/ssl.py", line 570, in hostname_checks_common_name
+    @hostname_checks_common_name.setter
+    
+  File "/root/miniconda3/lib/python3.12/site-packages/torch/utils/data/_utils/signal_handling.py", line 73, in handler
+    _error_if_any_worker_fails()
+RuntimeError: DataLoader worker (pid 436626) is killed by signal: Terminated.
+2026-10-03 21:26:17.671 | ERROR    | swanlab.sdk.internal.run:finish:776 - Failed to finish run, but it has been saved locally.

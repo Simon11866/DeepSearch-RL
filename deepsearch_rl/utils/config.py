@@ -29,6 +29,45 @@ except Exception:  # pragma: no cover
 ConfigLike = Union[dict, "Any"]  # OmegaConf DictConfig 或 dict
 
 
+def load_dotenv(path: Optional[str] = None) -> Optional[str]:
+    """读取 ``.env``（KEY=VALUE）写入 ``os.environ``。
+
+    已存在的环境变量不覆盖（命令行 export 优先）。找不到文件时静默跳过。
+    返回实际加载的路径；未加载则返回 None。
+    """
+    candidates = []
+    if path:
+        candidates.append(path)
+    else:
+        candidates.append(os.path.join(os.getcwd(), ".env"))
+        here = os.path.dirname(os.path.abspath(__file__))
+        proj_root = os.path.abspath(os.path.join(here, "..", ".."))
+        candidates.append(os.path.join(proj_root, ".env"))
+
+    seen = set()
+    loaded = None
+    for p in candidates:
+        ap = os.path.abspath(p)
+        if ap in seen or not os.path.isfile(ap):
+            continue
+        seen.add(ap)
+        with open(ap, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'").strip('"')
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        loaded = ap
+        break
+    return loaded
+
+
 def load_yaml(path: Optional[str]) -> ConfigLike:
     """读取 yaml 配置文件；path 为空时返回空配置。"""
     if not path:
@@ -109,4 +148,4 @@ def _maybe_scalar(v: str):
     return v
 
 
-__all__ = ["load_yaml", "merge_config", "dotlist"]
+__all__ = ["load_yaml", "merge_config", "dotlist", "load_dotenv"]

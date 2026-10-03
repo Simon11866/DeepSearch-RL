@@ -91,6 +91,8 @@ def classify_http_status(status_code: int, message: str = "") -> ToolError:
     """根据 HTTP 状态码构造对应类型的 ToolError。"""
     if status_code == 429:
         etype = ToolErrorType.RATE_LIMIT
+    elif status_code == 432 or "usage limit" in message.lower() or "exceeds your plan" in message.lower():
+        etype = ToolErrorType.QUOTA_EXHAUSTED
     elif status_code in (401, 403):
         etype = ToolErrorType.AUTH
     elif status_code == 404:

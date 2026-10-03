@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# DeepSearch-RL 训练启动脚本（8×4090 / veRL / SGLang / GRPO）
+# DeepSearch-RL 训练启动脚本（6×RTX 4090 / veRL / SGLang / GRPO）
 #
 # 用法：
-#   bash scripts/train.sh                       # 用默认 configs/grpo_qwen3_8b_8x4090.yaml
-#   bash scripts/train.sh data.train_batch_size=128   # 后面的 key=value 直接透传 Hydra
+#   bash scripts/train.sh                       # 用默认 configs/grpo_qwen3_8b_6x4090.yaml
+#   bash scripts/train.sh data.train_batch_size=56   # 后面的 key=value 直接透传 Hydra
 #
 # 前置（另外两个终端里要先起好）：
 #   - 检索服务：  bash scripts/start_retrieval.sh     (默认 127.0.0.1:8000)
@@ -18,6 +18,13 @@ set -euo pipefail
 
 # 切到工程根目录（本脚本位于 scripts/ 下）
 cd "$(dirname "$0")/.."
+
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
 
 # ---- 1) 关键环境变量检查（只提醒，不强行 export，便于用户自定义）----
 if [[ -z "${MODEL_PATH:-}" ]]; then
@@ -39,8 +46,19 @@ fi
 echo "[info] cwd=$(pwd)"
 echo "[info] MODEL_PATH=${MODEL_PATH:-<未设置>}"
 echo "[info] SWANLAB_MODE=${SWANLAB_MODE:-cloud}"
+echo "[info] JUDGE_BASE_URL=${JUDGE_BASE_URL:-<未设置>}"
+echo "[info] JUDGE_MODEL=${JUDGE_MODEL:-<未设置>}"
+
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+export RAY_DISABLE_DOCKER_CPU_WARNING="${RAY_DISABLE_DOCKER_CPU_WARNING:-1}"
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
+# 限制 OpenMP/BLAS 线程。不限制时第 1 步 ray.put 会因线程耗尽崩溃。
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 # ---- 2) 启动训练（剩余参数原样透传）----
 exec python -m deepsearch_rl.train.train_grpo \
-    --config configs/grpo_qwen3_8b_8x4090.yaml \
+    --config configs/grpo_qwen3_8b_6x4090.yaml \
     "$@"

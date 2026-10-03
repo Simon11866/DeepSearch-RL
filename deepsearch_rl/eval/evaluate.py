@@ -287,7 +287,7 @@ def build_markdown_table(agg: Dict[str, Any]) -> str:
         s for s in by_source if s not in SOURCE_ORDER
     ]
 
-    header = "| 指标 | Overall | " + " ".join(src_cols) + " |"
+    header = "| 指标 | Overall | " + " | ".join(src_cols) + " |"
     sep = "|---|---|" + "---|" * len(src_cols)
     lines = [header, sep]
 
@@ -420,6 +420,7 @@ async def _run_eval(args: argparse.Namespace) -> Dict[str, Any]:
     # c) 信号量并发跑 agent.run
     sem = asyncio.Semaphore(args.concurrency)
     model_hint_shown = {"done": False}
+    progress = {"n": 0, "total": len(rows)}
 
     async def _one(row: Dict[str, Any]) -> PerItemScore:
         async with sem:
@@ -447,7 +448,12 @@ async def _run_eval(args: argparse.Namespace) -> Dict[str, Any]:
                     answer_method="error", evidence_method="error",
                     error=f"{type(exc).__name__}: {exc}",
                 )
-            return await score_one(row, result, judge, judge_available, thresholds)
+            scored = await score_one(row, result, judge, judge_available, thresholds)
+            progress["n"] += 1
+            n = progress["n"]
+            if n == 1 or n % 10 == 0 or n == progress["total"]:
+                print(f"[progress] {n}/{progress['total']}", flush=True)
+            return scored
 
     print(f"[run] 并发={args.concurrency}，max_turns={args.max_turns}，开始推理…")
     items: List[PerItemScore] = await asyncio.gather(*[_one(r) for r in rows])
@@ -529,12 +535,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="被评模型的 SGLang/vLLM OpenAI 端点")
     p.add_argument("--model_name", default="default",
                    help="被评模型 served-model-name（默认 default）")
-    p.add_argument("--judge_base_url", default="http://127.0.0.1:8001/v1",
-                   help="Judge 服务 OpenAI 端点")
-    p.add_argument("--judge_model", default="judge", help="Judge 模型名")
-    p.add_argument("--search_backend", default="ddg",
-                   help="搜索后端 serper/serpapi/bing/brave/tavily/ddg（默认 ddg）")
-    p.add_argument("--max_turns", type=int, default=6, help="每题最多检索轮次")
+    p.add_argument("--judge_base_url",
+                   default=os.environ.get("JUDGE_BASE_URL", "https://api.deepseek.com/v1"),
+                   help="Judge OpenAI 端点（默认 DeepSeek）")
+    p.add_argument("--judge_model",
+                   default=os.environ.get("JUDGE_MODEL", "deepseek-chat"),
+                   help="Judge 模型名")
+    p.add_argument("--search_backend", default="free",
+                   help="搜索后端。free 会在 quark/so_m/shenma/sogou_wx/toutiao 之间自动切换")
+    p.add_argument("--max_turns", type=int, default=12, help="每题最多检索轮次")
     p.add_argument("--concurrency", type=int, default=16, help="并发题数")
     p.add_argument("--limit", type=int, default=None,
                    help="调试用：只跑前 N 题（默认全量 500）")
@@ -548,6 +557,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 async def evaluate_main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     """异步主入口；返回写入的 payload。"""
+    from ..utils.config import load_dotenv
+
+    load_dotenv()
     args = build_arg_parser().parse_args(argv)
 
     # compare 子能力：不跑评测，只对比两份结果

@@ -21,7 +21,7 @@ from .base import BaseTool
 from .cache import PersistentToolCache
 from .exceptions import ToolError, ToolErrorType
 from .key_pool import KeyRotator
-from .search_backend import SearchItem, build_provider
+from .search_backend import KEYLESS_BACKENDS, SearchItem, build_provider
 
 
 class SearchTool(BaseTool):
@@ -48,6 +48,9 @@ class SearchTool(BaseTool):
         self.max_retries = max_retries
         self.backoff_base = backoff_base
 
+    def cache_namespace(self) -> str:
+        return f"{self.name}:{self.backend}"
+
     # ------------------------------------------------------------------
     def _call_once(self, query: str, key: Optional[str]) -> List[SearchItem]:
         return self.provider.search(query, key=key, num=self.num_results)
@@ -59,8 +62,8 @@ class SearchTool(BaseTool):
         last_exc: Optional[ToolError] = None
         for attempt in range(self.max_retries + 1):
             key = self.rotator.get()
-            # ddg 后端不需要 key
-            if self.backend != "ddg" and key is None:
+            # 免费后端不需要 key
+            if self.backend not in KEYLESS_BACKENDS and key is None:
                 # 所有 key 都在冷却，等待后继续
                 time.sleep(min(self.backoff_base ** attempt, 8.0))
                 continue

@@ -97,7 +97,7 @@ def test_parser_search_call() -> None:
 
 def test_parser_open_call_and_registry() -> None:
     """含 <open> 的文本映射；并验证 get_tool_parser 注册中心可用。"""
-    parser = SearchXmlParser.get_tool_parser("search_xml")
+    parser = SearchXmlParser.get_tool_parser("search_xml", tokenizer=None)
     text = "<open>https://example.com/a?utm_source=x#frag</open>"
     out_text, calls = asyncio.run(parser.extract_tool_calls(text))
     assert len(calls) == 1
